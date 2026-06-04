@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <AzureFunctionsVersion>v4</AzureFunctionsVersion>
+    <RootNamespace>PositionProcessor</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings> 
+    <OutputType>Exe</OutputType> 
+  </PropertyGroup>
+  <ItemGroup>
+  
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Http" Version="3.2.0" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker" Version="1.23.0" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Sdk" Version="1.17.4" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.DurableTask" Version="1.1.4" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Timer" Version="4.3.1" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.Extensions.Storage.Blobs" Version="6.4.0" />
+    <PackageReference Include="Microsoft.ApplicationInsights.WorkerService" Version="2.22.0" />
+    <PackageReference Include="Microsoft.Azure.Functions.Worker.ApplicationInsights" Version="1.2.0" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.1" />
+    <PackageReference Include="Azure.Storage.Blobs" Version="12.21.0" />
+    <PackageReference Include="Azure.Identity" Version="1.12.0" />
+  </ItemGroup>
+</Project>
