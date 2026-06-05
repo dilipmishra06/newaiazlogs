@@ -220,71 +220,20 @@ public class LoadTradesActivity
     }
 
     [Function(nameof(LoadTradesActivity))]
-    public async Task<List<TradeRecord>> Run([ActivityTrigger] string blobPath)
+    public async Task Run([ActivityTrigger] object? input = null)
     {
         // ── Dev error injection ───────────────────────────────────────────────
         // When InjectDevError=true, skip the real blob download and write a
         // random error scenario directly to dbo.ApplicationErrors so the full
         // AIOps pipeline (RAG → Claude → Teams) exercises a realistic failure.
-        if (_injectDevError)
-        {
-            await InjectRandomErrorAsync(blobPath);
+       
+            await InjectRandomErrorAsync();
             // Throw so the orchestrator records FAILED in ProcessingRunLog too.
             throw new InvalidOperationException(
                 "Dev error injection active (InjectDevError=true). " +
                 "A synthetic error has been written to dbo.ApplicationErrors. " +
                 "Set InjectDevError=false to restore normal operation.");
-        }
-
-        // ── Normal production path ────────────────────────────────────────────
-        var parts = blobPath.Split('/', 2);
-
-        if (parts.Length != 2)
-        {
-            throw new ArgumentException(
-                $"Invalid blob path format: '{blobPath}'. Expected 'container/blobname'");
-        }
-
-        var container = parts[0];
-        var blobName  = parts[1];
-
-        _logger.LogInformation(
-            "Loading trades from blob. Container={Container}, Blob={Blob}",
-            container, blobName);
-
-        try
-        {
-            var containerClient = _blobClient.GetBlobContainerClient(container);
-            var blobClient      = containerClient.GetBlobClient(blobName);
-
-            _logger.LogInformation(
-                "Starting blob download. BlobPath={BlobPath}", blobPath);
-
-            var response = await blobClient.DownloadContentAsync();
-            var content  = response.Value.Content.ToString();
-
-            _logger.LogInformation(
-                "Blob download completed successfully. BlobPath={BlobPath}", blobPath);
-
-            var trades = ParseCsv(content);
-
-            _logger.LogInformation(
-                "Parsed {Count} trade records from {BlobPath}", trades.Count, blobPath);
-
-            return trades;
-        }
-        catch (RequestFailedException ex)
-        {
-            throw new Exception(
-                $"BlobAccessError | Status={ex.Status} | ErrorCode={ex.ErrorCode} | Message={ex.Message}",
-                ex);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(
-                ex, "Unexpected error while loading blob. BlobPath={BlobPath}", blobPath);
-            throw;
-        }
+        
     }
 
     // ── Dev helpers ───────────────────────────────────────────────────────────
@@ -294,7 +243,7 @@ public class LoadTradesActivity
     /// dbo.ApplicationErrors so the AIOps ErrorPoller picks it up on its
     /// next 2-minute poll.
     /// </summary>
-    private async Task InjectRandomErrorAsync(string blobPath)
+    private async Task InjectRandomErrorAsync()
     {
         var idx      = Random.Shared.Next(DevErrors.Count);
         var scenario = DevErrors[idx];
@@ -325,31 +274,5 @@ public class LoadTradesActivity
 
         _logger.LogWarning(
             "DEV ERROR INJECTION: scenario {Index} written to dbo.ApplicationErrors.", idx);
-    }
-
-    // ── CSV parser (unchanged) ────────────────────────────────────────────────
-
-    private static List<TradeRecord> ParseCsv(string csv)
-    {
-        var trades = new List<TradeRecord>();
-        var lines  = csv.Split('\n', StringSplitOptions.RemoveEmptyEntries);
-
-        foreach (var line in lines.Skip(1))
-        {
-            var cols = line.Split(',');
-            if (cols.Length < 7) continue;
-
-            trades.Add(new TradeRecord(
-                TradeId:    cols[0].Trim(),
-                Portfolio:  cols[1].Trim(),
-                Instrument: cols[2].Trim(),
-                Quantity:   decimal.Parse(cols[3].Trim()),
-                Price:      decimal.Parse(cols[4].Trim()),
-                Direction:  cols[5].Trim(),
-                TradeDate:  DateTime.Parse(cols[6].Trim())
-            ));
-        }
-
-        return trades;
     }
 }

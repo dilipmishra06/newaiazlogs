@@ -24,7 +24,7 @@ namespace PositionProcessor;
 public class PositionOrchestrator
 {
     [Function(nameof(PositionOrchestrator))]
-    public static async Task<ProcessingResult> RunOrchestrator(
+    public static async Task RunOrchestrator(
         [OrchestrationTrigger] TaskOrchestrationContext context)
     {
         var logger = context.CreateReplaySafeLogger(nameof(PositionOrchestrator));
@@ -36,30 +36,9 @@ public class PositionOrchestrator
         try
         {
             // Activity 1: Load trades from blob storage
-            var trades = await context.CallActivityAsync<List<TradeRecord>>(
-                nameof(LoadTradesActivity),
-                request.BlobPath);
+           await context.CallActivityAsync<List<TradeRecord>>(
+                nameof(LoadTradesActivity));
 
-            logger.LogInformation("Loaded {Count} trades for RunId={RunId}",
-                trades.Count, request.RunId);
-
-            if (trades.Count == 0)
-            {
-                await context.CallActivityAsync(nameof(InsertPositionsActivity),
-                    new InsertInput(null, request.RunId, "NO_DATA"));
-
-                return new ProcessingResult(0, 0, true, "No trades found");
-            }
-
-            // Activity 2: Calculate P&L and bulk insert to SQL
-            var inserted = await context.CallActivityAsync<int>(
-                nameof(InsertPositionsActivity),
-                new InsertInput(trades, request.RunId, "SUCCESS"));
-
-            logger.LogInformation("Inserted {Count} positions. RunId={RunId}",
-                inserted, request.RunId);
-
-            return new ProcessingResult(trades.Count, inserted, true, null);
         }
         catch (Exception ex)
         {
@@ -112,11 +91,7 @@ public class PositionOrchestrator
                     request.RunId);
             }
 
-            return new ProcessingResult(
-            TradesLoaded: 0,
-            PositionsInserted: 0,
-            Success: false,
-            Error: errorMessage);
+            return;
         }
     }
 
