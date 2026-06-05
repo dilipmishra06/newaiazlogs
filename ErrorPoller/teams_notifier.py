@@ -11,16 +11,105 @@ Card sections:
   5. SQL Query    — run against FinanceDb (Azure SQL)
   6. KQL Query    — run in Application Insights
   7. Disclaimer + upload RCA CTA
+
+Error-type classification
+─────────────────────────
+v1 used a hardcoded keyword list in _detect_error_type().
+That worked for ~20 known patterns but missed anything novel — ADF pipeline
+failures, Key Vault soft-delete states, NSG rule conflicts, ARM throttling,
+custom exception types, etc.
+
+v2 replaces it with a Claude Sonnet call (temp=0, max_tokens=60).
+The call is intentionally tiny — one short sentence — so it costs almost
+nothing and adds negligible latency to the notification path. The prompt
+asks Claude to classify the error into a SHORT human-readable label the same
+way the old keyword list did, but without any predefined vocabulary.
+
+Fallback: if the Claude call fails for any reason (timeout, API error, JSON
+parse) the function falls back to "Application Error" so the Teams card is
+never blocked.
 """
 
 import json
 import logging
 import os
 
+import anthropic
 import requests
 
 logger = logging.getLogger(__name__)
 
+# ── Error-type classifier via Claude ─────────────────────────────────────────
+
+_CLASSIFY_PROMPT = """\
+You are an Azure SRE. Given the error snippet below, return ONLY a short
+human-readable error-type label (2-5 words, title case, no punctuation).
+
+Examples of good labels:
+  SQL Login Failure
+  Blob Not Found
+  DNS Resolution Failure
+  Managed Identity Auth Error
+  ADF Pipeline Timeout
+  Key Vault Access Denied
+  NSG Blocked Outbound
+  DTU Exhaustion
+  ARM Throttling
+  Durable Function Replay Error
+  CSV Parse Failure
+  Private Endpoint Misconfiguration
+  Service Bus Dead Letter
+  Redis Connection Refused
+
+Return ONLY the label — no explanation, no quotes, no JSON.
+
+ERROR SNIPPET:
+{snippet}
+"""
+
+
+def _detect_error_type(snippet: str) -> str:
+    """
+    Classify the error snippet into a short human-readable label.
+
+    Uses Claude Sonnet (temp=0, max_tokens=60) so any error type —
+    including novel ones never seen before — gets a meaningful label
+    rather than the generic "Application Error" fallback.
+
+    Falls back to "Application Error" on any API failure so the
+    Teams notification is never blocked.
+    """
+    if not snippet or not snippet.strip():
+        return "Application Error"
+
+    try:
+        client = anthropic.Anthropic(
+            api_key=os.environ["CLAUDE_FOUNDRY_KEY"],
+            base_url=os.environ["CLAUDE_FOUNDRY_ENDPOINT"],
+        )
+        response = client.messages.create(
+            model=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5"),
+            max_tokens=60,
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": _CLASSIFY_PROMPT.format(snippet=snippet[:800]),
+            }],
+        )
+        label = response.content[0].text.strip()
+        # Safety guard: if the model returns something unexpectedly long or
+        # multi-line, truncate to the first line.
+        label = label.splitlines()[0].strip()
+        if label:
+            logger.debug("Claude error-type classification: %r", label)
+            return label
+    except Exception as exc:
+        logger.warning("Error-type classification via Claude failed: %s — using fallback", exc)
+
+    return "Application Error"
+
+
+# ── Main notifier ─────────────────────────────────────────────────────────────
 
 def send_teams_notification(
     error_id:      int,
@@ -38,7 +127,9 @@ def send_teams_notification(
     color, emoji       = _priority_style(priority)
     confidence         = ai_suggestion.get("confidence", "medium")
     cascade            = ai_suggestion.get("cascade_risk", "unknown")
-    error_type         = _detect_error_type(error_snippet)
+
+    # Dynamic classification — no hardcoded keywords
+    error_type = _detect_error_type(error_snippet)
 
     confidence_display = {
         "high":   "🟢 High",
@@ -56,7 +147,6 @@ def send_teams_notification(
     if isinstance(action, list):
         action = "\n".join(f"{i+1}. {s}" for i, s in enumerate(action))
 
-    # SQL and KQL are now separate fields — never conflated
     suggested_sql = ai_suggestion.get(
         "suggested_sql",
         "SELECT TOP 10 * FROM dbo.ApplicationErrors ORDER BY ErrorId DESC",
@@ -66,7 +156,6 @@ def send_teams_notification(
         "exceptions | where timestamp > ago(1h) | order by timestamp desc | take 20",
     )
 
-    # RAG context counts — code_chunks removed (no code index exists)
     rcas        = rag_context.get("rcas", [])
     system_docs = rag_context.get("system_docs", [])
     context_display = f"{len(rcas)} RCA(s) · {len(system_docs)} system doc(s)"
@@ -177,6 +266,8 @@ def send_teams_notification(
     response.raise_for_status()
 
 
+# ── Knowledge section builder ─────────────────────────────────────────────────
+
 def _build_knowledge_section(
     ai_suggestion: dict,
     rcas:          list,
@@ -229,35 +320,7 @@ def _build_knowledge_section(
     }
 
 
-def _detect_error_type(snippet: str) -> str:
-    s = snippet.lower()
-    checks = [
-        (["oomkilled", "out of memory", "memory limit"],        "OOMKilled"),
-        (["crashloopbackoff", "crash loop"],                    "CrashLoopBackOff"),
-        (["imagepullbackoff", "errimagepull"],                  "ImagePullBackOff"),
-        (["deadlock", "deadlockdetected"],                      "SQL Deadlock"),
-        (["connection pool", "too many connections"],           "DB Connection Pool"),
-        (["nullreferenceexception", "attributeerror: 'none'"],  "NullReferenceException"),
-        (["timeout", "timed out"],                              "Timeout"),
-        (["connection refused", "circuit breaker"],             "Connectivity Error"),
-        (["dns", "nxdomain", "no such host"],                   "DNS Error"),
-        (["private endpoint", "no route to host"],              "Network Error"),
-        (["redis", "cache"],                                     "Cache Error"),
-        (["servicebus", "service bus", "dead letter"],          "Service Bus Error"),
-        (["keyvault", "key vault", "secret"],                   "Key Vault Error"),
-        (["429", "rate limit", "throttl"],                      "Throttling Error"),
-        (["401", "403", "unauthorized", "forbidden"],           "Auth Error"),
-        (["login failed", "sqlexception", "asyncpg"],           "Database Error"),
-        (["blobnotfound", "requestfailedexception"],            "Blob Storage Error"),
-        (["formatexception", "invalid format"],                 "Data Quality Error"),
-        (["azuresigningerror", "base64", "signing"],            "Auth Config Error"),
-        (["imagetag", "notfound", "404"],                       "Not Found"),
-    ]
-    for keywords, label in checks:
-        if any(k in s for k in keywords):
-            return label
-    return "Application Error"
-
+# ── Priority helpers ──────────────────────────────────────────────────────────
 
 def _priority_style(priority: str) -> tuple:
     return {

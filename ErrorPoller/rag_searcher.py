@@ -4,36 +4,70 @@ ErrorPoller/rag_searcher.py
 Searches system-knowledge-base and rca-knowledge-base in Azure AI Search.
 Returns typed results so Claude knows what kind of context it received.
 
-KEY CHANGE from v1
-──────────────────
-The previous version ran a single generic vector query against system-knowledge-base.
-That produced irrelevant chunks (HttpStarter, DailyPositionScheduler) for a 403 blob
-error because the generic embedding drifted toward scheduler/orchestrator content.
+Signal Classification — v4 (fully open vocabulary)
+────────────────────────────────────────────────────
+v2 used four hardcoded keyword sets: _BLOB_SIGNALS, _SQL_SIGNALS,
+_DNS_SIGNALS, _AUTH_SIGNALS. That worked for the five known failure modes.
 
-This version runs MULTIPLE targeted queries with chunk_type filters:
+v3 replaced keyword sets with a Claude call returning four fixed booleans
+{blob, auth, dns, sql}. Better — but still a closed vocabulary. An ADF
+pipeline timeout, an NSG rule block, a Key Vault soft-delete, an ARM
+throttling event, or a custom application exception would either map
+badly to one of four buckets or be missed entirely.
 
-  1. failure_modes   — always. Finds the specific activity + exception pattern.
-  2. infrastructure  — always for blob/SQL/auth errors. Forces network + VNet +
-                       private endpoint + RBAC chunks into context regardless of
-                       what the generic embedding retrieves. This is the fix for
-                       the 403 analysis missing the network layer entirely.
-  3. resolution_steps — always. Retrieves known fix procedures.
-  4. schema          — for SQL errors only.
+v4 removes the fixed category list entirely. A single Claude call now
+returns TWO things:
 
-Results from all queries are deduplicated by chunk id, re-ranked by semantic
-score descending, and capped at top_k before being returned to the caller.
+  1. signals — a free-text list of affected technology domains, e.g.
+     ["Azure Data Factory", "Blob Storage", "Managed Identity"]
+     Claude infers these from the error context, not from any preset list.
+
+  2. query_plan — for each signal, the chunk_type to search and a short
+     targeted query string optimised for that domain. Claude writes the
+     query strings itself, so infrastructure chunks are retrieved using
+     the vocabulary that actually appears in those chunks, not the
+     vocabulary that appears in the error.
+
+The RAG layer executes exactly the queries Claude specifies, plus two
+fixed queries (failure_modes, resolution_steps) that always run.
+
+Example — NSG-blocked SQL connection:
+  signals:    ["Azure SQL", "VNet NSG", "Private Endpoint"]
+  query_plan: [
+    { "chunk_type": "infrastructure",
+      "query": "NSG outbound rule TCP 1433 SQL private endpoint snet-functions pe-sql-poc01" },
+    { "chunk_type": "schema",
+      "query": "dbo.ProcessingRunLog dbo.Positions dbo.ApplicationErrors" }
+  ]
+
+Example — ADF timeout, blob never arrived:
+  signals:    ["Azure Data Factory", "Blob Storage"]
+  query_plan: [
+    { "chunk_type": "infrastructure",
+      "query": "ADF pipeline blob storage copy activity trades container upload schedule" }
+  ]
+
+Fallback
+────────
+If the Claude call fails, _build_query_plan() falls back to a single
+infrastructure query using the raw error text. The two fixed queries
+(failure_modes, resolution_steps) still run, so the pipeline is never
+fully blind.
 
 Threshold guidance
 ──────────────────
-With a small corpus (< 20 RCAs) the semantic reranker rarely exceeds 2.5 even
-on strong matches. Safe starting point: RCA ≥ 1.2, system docs ≥ 1.0.
-Set AIOPS_LOG_ALL_RAG_SCORES=true to log every pre-threshold candidate score.
+With a small corpus (< 20 RCAs) the semantic reranker rarely exceeds 2.5
+even on strong matches. Safe starting point: RCA >= 1.2, system docs >= 1.0.
+Set AIOPS_LOG_ALL_RAG_SCORES=true to log every pre-threshold candidate.
 """
 
+import json
 import logging
 import os
+import re
 from typing import Optional
 
+import anthropic
 from azure.core.credentials import AzureKeyCredential
 from azure.search.documents import SearchClient
 from azure.search.documents.models import VectorizedQuery
@@ -45,7 +79,6 @@ _search_clients: dict[str, SearchClient] = {}
 _openai_client: Optional[AzureOpenAI]   = None
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
-# Tune empirically once score distributions are visible in logs.
 RCA_SEMANTIC_THRESHOLD    = float(os.environ.get("RAG_RCA_SEMANTIC_THRESHOLD",    "1.2"))
 RCA_VECTOR_THRESHOLD      = float(os.environ.get("RAG_RCA_VECTOR_THRESHOLD",      "0.70"))
 SYSTEM_SEMANTIC_THRESHOLD = float(os.environ.get("RAG_SYSTEM_SEMANTIC_THRESHOLD", "1.0"))
@@ -53,26 +86,154 @@ SYSTEM_RRF_THRESHOLD      = float(os.environ.get("RAG_SYSTEM_RRF_THRESHOLD",    
 
 _LOG_ALL_SCORES = os.environ.get("AIOPS_LOG_ALL_RAG_SCORES", "false").lower() == "true"
 
-# ── Error classification signals ──────────────────────────────────────────────
-# Used to decide which supplementary chunk_type queries to fire.
-_BLOB_SIGNALS   = {"blob", "storage", "403", "401", "authorization", "authorizationfailure",
-                   "blobnotfound", "404", "requestfailedexception"}
-_SQL_SIGNALS    = {"sql", "login failed", "timeout", "deadlock", "bulkcopy",
-                   "sqlexception", "dtu"}
-_DNS_SIGNALS    = {"dns", "no such host", "nxdomain", "host"}
-_AUTH_SIGNALS   = {"403", "401", "authorization", "authorizationfailure",
-                   "login failed", "managed identity"}
+# ── Query plan via Claude ─────────────────────────────────────────────────────
+
+_PLAN_PROMPT = """\
+You are an Azure SRE building a retrieval query plan for an error in a
+Finance Position Processing system running on Azure Durable Functions.
+
+The knowledge base contains chunked architecture documentation indexed
+under these chunk_type values:
+  failure_modes    — known exception patterns per activity
+  infrastructure   — VNet, subnets, private endpoints, NSG, DNS, RBAC, MSI, Key Vault, storage firewall
+  resolution_steps — manual fix procedures, retrigger commands, SQL user creation scripts
+  schema           — dbo.Positions, dbo.ProcessingRunLog, dbo.ApplicationErrors column definitions
+  kql_queries      — pre-built KQL queries for Application Insights
+  general          — unclassified architecture content
+
+Given the error text below, return ONLY a JSON object with this exact
+structure — no markdown, no explanation:
+
+{{
+  "signals": [<list of affected Azure service or technology domains as plain strings>],
+  "query_plan": [
+    {{
+      "chunk_type": <one of the chunk_type values above>,
+      "query": <a short targeted search string using vocabulary that would appear IN the matching documentation chunk, not vocabulary from the error itself>
+    }}
+  ]
+}}
+
+Rules for signals:
+  - Use specific Azure service names: "Azure SQL", "Azure Blob Storage",
+    "Azure Data Factory", "VNet NSG", "Private Endpoint", "DNS",
+    "Managed Identity", "Key Vault", "App Service Plan", "Durable Functions",
+    "SqlBulkCopy", "Azure Service Bus", "Azure Cache for Redis", etc.
+  - Include all domains you can infer from context, not just explicit keywords.
+    "No connection to 10.0.2.5:1433" -> ["Azure SQL", "VNet NSG", "Private Endpoint"]
+    "ADF pipeline CopyTradesToBlob did not complete" -> ["Azure Data Factory", "Azure Blob Storage"]
+    "Login failed for user id-positionprocessor" -> ["Azure SQL", "Managed Identity"]
+
+Rules for query_plan:
+  - Include an infrastructure entry whenever the error could involve
+    networking, identity, firewall, private endpoints, DNS, or RBAC --
+    even if those words do not appear in the error. Write the query using
+    the vocabulary that appears in infrastructure documentation.
+  - Include a schema entry only if the error involves SQL tables or data.
+  - Do NOT include failure_modes or resolution_steps -- those always run
+    separately and do not need to appear here.
+  - Maximum 4 entries in query_plan.
+  - Each query string should be 10-25 words of domain-specific vocabulary.
+
+ERROR TEXT:
+{error_text}
+"""
 
 
-def _classify(message: str) -> set[str]:
-    """Return a set of signal categories present in the error message."""
-    lower  = message.lower()
-    active = set()
-    if any(s in lower for s in _BLOB_SIGNALS):   active.add("blob")
-    if any(s in lower for s in _SQL_SIGNALS):    active.add("sql")
-    if any(s in lower for s in _DNS_SIGNALS):    active.add("dns")
-    if any(s in lower for s in _AUTH_SIGNALS):   active.add("auth")
-    return active
+def _build_query_plan(error_text: str) -> dict:
+    """
+    Calls Claude to produce a dynamic query plan for this specific error.
+
+    Returns:
+      {
+        "signals":    ["Azure SQL", "Managed Identity", ...],
+        "query_plan": [
+          {"chunk_type": "infrastructure", "query": "..."},
+          ...
+        ]
+      }
+
+    Falls back to a single generic infrastructure query if the call fails.
+
+    Fixes vs v4 original
+    ─────────────────────
+    1. max_tokens raised 400 → 800. The JSON plan for a 3-signal, 4-entry
+       error was regularly hitting the token ceiling mid-object, producing
+       truncated JSON and a JSONDecodeError whose str() started with the
+       fragment that was next in the stream (e.g. '\\n  "signals"').
+    2. stop_reason check added immediately after the API call. A truncated
+       response now raises with a clear message before json.loads is reached.
+    3. Exception logging now includes type(exc).__name__ so the log line
+       distinguishes JSONDecodeError / ValueError / APIError / etc.
+    """
+    try:
+        client = anthropic.Anthropic(
+            api_key=os.environ["CLAUDE_FOUNDRY_KEY"],
+            base_url=os.environ["CLAUDE_FOUNDRY_ENDPOINT"],
+        )
+        response = client.messages.create(
+            model=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5"),
+            max_tokens=800,   # raised from 400 — plan JSON can be 300-600 tokens
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": _PLAN_PROMPT.format(error_text=error_text[:2000]),
+            }],
+        )
+
+        # Detect truncation before attempting to parse.  A truncated JSON
+        # object causes json.loads to raise JSONDecodeError; the str() of
+        # that exception starts with the fragment that was next in the
+        # stream, which looks like a misleading value in the log.
+        if response.stop_reason == "max_tokens":
+            tail = response.content[0].text[-120:] if response.content else ""
+            raise ValueError(
+                f"Claude response truncated at max_tokens limit; "
+                f"increase budget or shorten prompt. tail={tail!r}"
+            )
+
+        raw = response.content[0].text
+
+        # Extract the first {...} block — handles any combination of:
+        #   - leading/trailing whitespace or newlines
+        #   - ```json...``` or ```...``` fences
+        #   - preamble text before the JSON ("Here is the plan:\n{...")
+        # re.DOTALL so . matches newlines inside the JSON object.
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not match:
+            logger.warning(
+                "Claude query plan: no JSON object found in response. "
+                "stop_reason=%s raw=%r",
+                response.stop_reason, raw[:300],
+            )
+            raise ValueError("No JSON object in Claude response")
+
+        plan = json.loads(match.group())
+        signals    = plan.get("signals", [])
+        query_plan = plan.get("query_plan", [])
+
+        logger.info(
+            "Claude query plan: signals=%s  queries=%d",
+            signals, len(query_plan),
+        )
+        return {"signals": signals, "query_plan": query_plan}
+
+    except Exception as exc:
+        # Include the exception *type* in the log so the message
+        # distinguishes JSONDecodeError / ValueError / APIError / etc.
+        logger.warning(
+            "Claude query plan failed (%s: %s) — using fallback infrastructure query",
+            type(exc).__name__, str(exc)[:120],
+        )
+        return {
+            "signals": [],
+            "query_plan": [
+                {
+                    "chunk_type": "infrastructure",
+                    "query": error_text[:300],
+                }
+            ],
+        }
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -85,24 +246,29 @@ def search_knowledge_bases(
 ) -> dict:
     """
     Search both indexes and return:
-      { "rcas": [...], "system_docs": [...] }
+      { "rcas": [...], "system_docs": [...], "signals": [...] }
 
-    error_text should contain only diagnostic signal (ErrorMessage + ExceptionType
-    + Stage). Do NOT include RunId, timestamps, or business dates — those dilute
-    the embedding and cause the retriever to return scheduling/metadata chunks
-    instead of failure-mode and infrastructure chunks.
+    error_text should contain only diagnostic signal (ErrorMessage +
+    ExceptionType + Stage). Do NOT include RunId, timestamps, or business
+    dates -- those dilute the embedding and cause the retriever to return
+    scheduling/metadata chunks instead of failure-mode and infrastructure
+    chunks.
     """
-    oai       = _get_openai_client()
-    signals   = _classify(error_text)
-    embedding = _embed(oai, error_text)
+    oai  = _get_openai_client()
+    plan = _build_query_plan(error_text)
 
+    embedding   = _embed(oai, error_text)
     rcas        = _search_rcas(embedding, error_text, service, top_k)
-    system_docs = _search_system(embedding, error_text, service, signals, top_k=4)
+    system_docs = _search_system(embedding, error_text, service, plan, top_k=4)
 
-    return {"rcas": rcas, "system_docs": system_docs}
+    return {
+        "rcas":        rcas,
+        "system_docs": system_docs,
+        "signals":     plan.get("signals", []),  # surfaced in Teams card
+    }
 
 
-# ── RCA search (unchanged from v1 — was working correctly) ────────────────────
+# ── RCA search ────────────────────────────────────────────────────────────────
 
 def _search_rcas(
     embedding:  list[float],
@@ -186,57 +352,33 @@ def _search_rcas(
     return out[:top_k]
 
 
-# ── System doc search — REWRITTEN ─────────────────────────────────────────────
+# ── System doc search ─────────────────────────────────────────────────────────
 
 def _search_system(
     embedding:  list[float],
     error_text: str,
     service:    str,
-    signals:    set[str],
+    plan:       dict,
     top_k:      int,
 ) -> list[dict]:
     """
-    Multi-query targeted retrieval against system-knowledge-base.
+    Executes the Claude-generated query plan against system-knowledge-base,
+    plus two fixed queries that always run regardless of error type:
 
-    Why multi-query instead of a single generic search:
-      A single vector query embeds the full error text and finds the chunk whose
-      embedding is closest in cosine space. For a 403 blob error the top result
-      tends to be LoadTradesActivity (correct) but positions 2-3 drift toward
-      scheduler/orchestrator content because those chunks share vocabulary with
-      the error context (RunId, BlobPath, ActivityName). The network/VNet chunk
-      never surfaces because "private endpoint" and "DNS zone" are not in the
-      error text at all — they are the *missing* context, not present context.
+      Fixed Q1 — failure_modes   (finds the activity + exception pattern)
+      Fixed Q2 — resolution_steps (retrieves known fix procedures)
 
-      Running separate targeted queries with chunk_type filters guarantees that
-      infrastructure and resolution_steps chunks are always retrieved for the
-      error categories that need them, regardless of what the generic embedding
-      finds.
-
-    Query plan:
-      Q1  failure_modes   — always — finds the activity+exception match
-      Q2  infrastructure  — blob|auth|dns errors — forces VNet/endpoint/RBAC chunks
-      Q3  resolution_steps — always — retrieves known fix procedures
-      Q4  schema          — SQL errors only — pulls table definitions if relevant
-
-    Results are deduplicated by chunk id, sorted by semantic score descending,
-    capped at top_k.
+    The dynamic queries from Claude's plan cover everything else:
+    infrastructure, schema, kql_queries, or general chunks as needed,
+    using query strings Claude crafted to match documentation vocabulary.
     """
     svc_filter = f"service eq '{service}' or service eq 'platform'" if service else None
     seen_ids:  set[str]   = set()
     all_hits:  list[dict] = []
 
-    def _run_query(
-        text:       str,
-        chunk_type: str,
-        label:      str,
-        n:          int = 2,
-    ) -> None:
-        """Execute one targeted query and accumulate results into all_hits."""
+    def _run_query(text: str, chunk_type: str, label: str, n: int = 2) -> None:
         type_filter = f"chunk_type eq '{chunk_type}'"
-        combined    = (
-            f"({svc_filter}) and ({type_filter})"
-            if svc_filter else type_filter
-        )
+        combined    = f"({svc_filter}) and ({type_filter})" if svc_filter else type_filter
         vq = VectorizedQuery(
             vector=_embed(_get_openai_client(), text),
             k_nearest_neighbors=20,
@@ -316,36 +458,8 @@ def _search_system(
                 "_query":      label,
             })
 
-    # ── Q1: failure mode — always ─────────────────────────────────────────────
-    _run_query(
-        text=error_text,
-        chunk_type="failure_modes",
-        label="failure_mode",
-        n=2,
-    )
-
-    # ── Q2: infrastructure — blob, auth, or DNS errors ────────────────────────
-    # This is the critical query that was missing in v1.
-    # A 403 on Azure Blob Storage with public access disabled can be caused by:
-    #   - Private endpoint misconfiguration (network layer)
-    #   - Missing RBAC role assignment (identity layer)
-    # Both are documented in infrastructure chunks (sections 5.1, 5.3, 6.1).
-    # A generic embedding of the 403 error text never retrieves these chunks
-    # because "VNet", "private endpoint", "DNS zone" are not in the error.
-    # The targeted query with explicit infrastructure vocabulary forces retrieval.
-    if signals & {"blob", "auth", "dns"}:
-        _run_query(
-            text=(
-                "VNet private endpoint DNS zone blob storage network access "
-                "snet-functions vnet_route_all_enabled managed identity RBAC "
-                "Storage Blob Data Reader id-positionprocessor pe-storage-poc01"
-            ),
-            chunk_type="infrastructure",
-            label="network_and_rbac",
-            n=3,
-        )
-
-    # ── Q3: resolution steps — always ────────────────────────────────────────
+    # ── Fixed queries — always run regardless of error type ───────────────────
+    _run_query(error_text, chunk_type="failure_modes",    label="failure_mode", n=2)
     _run_query(
         text=f"{error_text} resolution fix manual trigger retrigger",
         chunk_type="resolution_steps",
@@ -353,24 +467,28 @@ def _search_system(
         n=2,
     )
 
-    # ── Q4: schema — SQL errors only ──────────────────────────────────────────
-    if "sql" in signals:
+    # ── Dynamic queries — exactly what Claude planned ─────────────────────────
+    query_plan = plan.get("query_plan", [])
+    for i, entry in enumerate(query_plan[:4]):   # cap at 4 dynamic queries
+        chunk_type = entry.get("chunk_type", "general")
+        query_text = entry.get("query", "")
+        if not query_text:
+            continue
         _run_query(
-            text="dbo.ProcessingRunLog dbo.Positions dbo.ApplicationErrors schema columns",
-            chunk_type="schema",
-            label="schema",
-            n=1,
+            text=query_text,
+            chunk_type=chunk_type,
+            label=f"dynamic_{i}_{chunk_type}",
+            n=2,
         )
 
-    # ── Deduplicate, sort by score, cap at top_k ──────────────────────────────
     all_hits.sort(key=lambda h: h["_sort_key"], reverse=True)
     for hit in all_hits:
         hit.pop("_sort_key", None)
         hit.pop("_query",    None)
 
     logger.info(
-        "System index: %d unique result(s) from %d targeted queries",
-        len(all_hits), sum(1 for s in ("blob", "auth", "dns", "sql") if s in signals) + 2,
+        "System index: %d unique result(s) — 2 fixed + %d dynamic queries",
+        len(all_hits), len(query_plan),
     )
     return all_hits[:top_k]
 
@@ -378,10 +496,6 @@ def _search_system(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _keywords(text: str) -> str:
-    """
-    Strip stack-frame noise before BM25 to avoid irrelevant keyword hits on
-    common method names (CallActivityAsync, RunOrchestrator, etc.).
-    """
     text = text[:500]
     for noise in ("at System.", "at Microsoft.", "at DurableTask.",
                   "at PositionProcessor.", "in /home/", "line "):
