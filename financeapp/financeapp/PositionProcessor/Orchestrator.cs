@@ -1,5 +1,7 @@
 using Microsoft.Azure.Functions.Worker;
+using Microsoft.Data.SqlClient;
 using Microsoft.DurableTask;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using PositionProcessor.Activities;
 using PositionProcessor.Models;
@@ -7,114 +9,121 @@ using System.Text.Json;
 
 namespace PositionProcessor;
 
-/// <summary>
-/// Durable orchestrator — coordinates the two activities:
-///   1. LoadTradesActivity     — reads CSV from blob, returns List&lt;TradeRecord&gt;
-///   2. InsertPositionsActivity — calculates P&amp;L and BulkInserts to SQL
-///
-/// App Insights automatically tracks:
-///   - Each activity as a dependency call with duration
-///   - Any exceptions thrown inside activities
-///   - The orchestration as a parent operation
-///
-/// On failure, a structured JSON error message is written to ProcessingRunLog
-/// containing: stage, exception type, message, stack summary, blob path, and
-/// business date — designed for AI-assisted root cause analysis.
-/// </summary>
 public class PositionOrchestrator
 {
+    private readonly string _connectionString;
+
+    public PositionOrchestrator(IConfiguration config)
+    {
+        _connectionString = config["SqlConnectionString"]!;
+    }
+
     [Function(nameof(PositionOrchestrator))]
-    public static async Task RunOrchestrator(
+    public async Task RunOrchestrator(
         [OrchestrationTrigger] TaskOrchestrationContext context)
     {
-        var logger = context.CreateReplaySafeLogger(nameof(PositionOrchestrator));
+        var logger  = context.CreateReplaySafeLogger(nameof(PositionOrchestrator));
         var request = context.GetInput<ProcessingRequest>()!;
 
         logger.LogInformation("Orchestrator started. RunId={RunId} BlobPath={BlobPath}",
             request.RunId, request.BlobPath);
 
+        List<TradeRecord>? trades       = null;
+        string             status       = "SUCCESS";
+        string?            errorMessage = null;
+
         try
         {
-            // Activity 1: Load trades from blob storage
-           await context.CallActivityAsync<List<TradeRecord>>(
-                nameof(LoadTradesActivity));
-
+            trades = await context.CallActivityAsync<List<TradeRecord>>(
+                nameof(LoadTradesActivity), request);
         }
-        catch (Exception ex)
+        catch (TaskFailedException ex)
         {
-            var durableEx = ex as TaskFailedException;
+            status       = "FAILED";
+            errorMessage = ex.Message;
 
-            var realMessage = durableEx != null
-                ? ExtractRealMessage(durableEx.Message)
-                : ex.Message;
+            logger.LogError(ex,
+                "Orchestrator failed. RunId={RunId} Stage={Stage}",
+                request.RunId, ex.TaskName);
 
-            var stage = durableEx?.TaskName ?? "Orchestrator";
-
-            var errorDetail = new
+            // Only write to dbo.ApplicationErrors for genuine errors
+            // SimulateFailure throws InvalidOperationException with fabricated JSON —
+            // we detect it by checking if the message is valid JSON
+            if (!request.SimulateFailure)
             {
-                FailedAt = DateTime.UtcNow,
-                RunId = request.RunId,
-                BlobPath = request.BlobPath,
-                BusinessDate = request.BusinessDate,
-                Stage = stage,
-                ExceptionType = ex.GetType().FullName,
-                Message = realMessage,
-                StackTrace = ex.StackTrace,
-                FullChain = GetExceptionChain(ex),
-                OrchestrationInstanceId = context.InstanceId
-            };
-
-            var errorMessage = JsonSerializer.Serialize(errorDetail);
-
-            logger.LogError(
-                ex,
-                "Orchestrator failed. RunId={RunId} Stage={Stage} Error={Error}",
-                request.RunId,
-                stage,
-                realMessage);
-
-            try
-            {
-                await context.CallActivityAsync(
-                    nameof(InsertPositionsActivity),
-                    new InsertInput(
-                        Trades: null,
-                        RunId: request.RunId,
-                        Status: "FAILED",
-                        ErrorMessage: errorMessage));
+                await WriteApplicationErrorAsync(
+                    request.RunId,
+                    "PositionProcessor",
+                    BuildErrorJson(request, ex, ex.TaskName),
+                    ex.StackTrace);
             }
-            catch (Exception logEx)
-            {
-                logger.LogWarning(
-                    logEx,
-                    "Failed to write error log to SQL. RunId={RunId}",
-                    request.RunId);
-            }
+        }
 
-            return;
+        // Always write to dbo.ProcessingRunLog — success or failure, real or simulated
+        try
+        {
+            await context.CallActivityAsync(
+                nameof(InsertPositionsActivity),
+                new InsertInput(
+                    Trades:       trades,
+                    RunId:        request.RunId,
+                    Status:       status,
+                    ErrorMessage: errorMessage));
+        }
+        catch (TaskFailedException logEx)
+        {
+            logger.LogWarning(logEx,
+                "Failed to write run log to SQL. RunId={RunId}", request.RunId);
         }
     }
 
-    // Extracts the real error from Durable's wrapper message:
-    // "Task 'LoadTradesActivity' (#0) failed with an unhandled exception: <REAL ERROR HERE>"
-    private static string ExtractRealMessage(string durableMessage)
+    private async Task WriteApplicationErrorAsync(
+        string runId,
+        string serviceName,
+        string errorMessage,
+        string? stackTrace)
     {
-        const string marker = "failed with an unhandled exception: ";
-        var idx = durableMessage.IndexOf(marker, StringComparison.OrdinalIgnoreCase);
-        return idx >= 0
-            ? durableMessage[(idx + marker.Length)..].Trim()
-            : durableMessage;
+        const string sql = """
+            INSERT INTO dbo.ApplicationErrors
+                (ServiceName, ErrorMessage, StackTrace, RunId, CreatedAt)
+            VALUES
+                (@ServiceName, @ErrorMessage, @StackTrace, @RunId, @CreatedAt)
+            """;
+
+        await using var conn = new SqlConnection(_connectionString);
+        await conn.OpenAsync();
+
+        await using var cmd = new SqlCommand(sql, conn);
+        cmd.Parameters.AddWithValue("@ServiceName",  serviceName);
+        cmd.Parameters.AddWithValue("@ErrorMessage", errorMessage);
+        cmd.Parameters.AddWithValue("@StackTrace",   (object?)stackTrace ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("@RunId",        runId);
+        cmd.Parameters.AddWithValue("@CreatedAt",    DateTime.UtcNow);
+
+        await cmd.ExecuteNonQueryAsync();
+    }
+
+    private static string BuildErrorJson(ProcessingRequest request, Exception ex, string stage)
+    {
+        var detail = new
+        {
+            FailedAt      = DateTime.UtcNow,
+            RunId         = request.RunId,
+            BlobPath      = request.BlobPath,
+            BusinessDate  = request.BusinessDate,
+            Stage         = stage,
+            ExceptionType = ex.GetType().FullName,
+            Message       = ex.Message,
+            FullChain     = GetExceptionChain(ex),
+        };
+        return JsonSerializer.Serialize(detail);
     }
 
     private static string[] GetExceptionChain(Exception ex)
     {
         var chain = new List<string>();
-        var current = ex;
-        while (current != null)
-        {
-            chain.Add($"{current.GetType().Name}: {current.Message}");
-            current = current.InnerException;
-        }
+        for (var cur = ex; cur != null; cur = cur.InnerException)
+            chain.Add($"{cur.GetType().Name}: {cur.Message}");
         return chain.ToArray();
     }
 }

@@ -1,69 +1,16 @@
-using Azure;
-using Azure.Storage.Blobs;
 using Microsoft.Azure.Functions.Worker;
-using Microsoft.Data.SqlClient;
-using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using PositionProcessor.Models;
-using System.Data;
 using System.Text.Json;
 
 namespace PositionProcessor.Activities;
 
-/// <summary>
-/// Loads trade CSV from Azure Blob Storage.
-///
-/// App Insights tracking:
-///   - Blob download logged as an outbound dependency automatically
-///     by the Azure SDK instrumentation (Azure.Storage.Blobs telemetry)
-///   - Duration of the activity appears in App Insights as a dependency
-///   - RequestFailedException details are logged with Status and ErrorCode
-///     to improve RCA accuracy in AIOps
-///
-/// Dev Error Injection
-/// ───────────────────
-/// Set app setting  InjectDevError=true  to skip the real blob download
-/// and instead write one of 5 realistic failure scenarios directly to
-/// dbo.ApplicationErrors (mirroring what the orchestrator catch block
-/// writes on a real failure).
-///
-/// The 5 injected error scenarios span the key failure domains this system
-/// is likely to encounter in production:
-///
-///   1. ADF pipeline copy activity timeout feeding upstream blob data
-///   2. Storage account public-access firewall blocking the download
-///   3. SQL Managed Identity login failure after infra redeploy
-///   4. VNet/NSG rule blocking outbound to the private SQL endpoint
-///   5. Malformed CSV — non-numeric price field causing FormatException
-///
-/// Toggle via Azure Portal → Function App → Configuration → App Settings:
-///   InjectDevError  =  true   (inject a random error instead of real run)
-///   InjectDevError  =  false  (normal production behaviour — default)
-/// </summary>
 public class LoadTradesActivity
 {
-    private readonly BlobServiceClient _blobClient;
     private readonly ILogger<LoadTradesActivity> _logger;
-    private readonly string _connectionString;
-    private readonly bool _injectDevError;
 
-    // ── 5 realistic injected error scenarios ─────────────────────────────────
-    //
-    // Each entry is the full structured JSON that the orchestrator catch block
-    // would normally write into dbo.ApplicationErrors.ErrorMessage.
-    // They are written verbatim so the AIOps ErrorPoller sees them as real
-    // failures and exercises the full RAG → Claude → Teams pipeline.
-    //
-    // Scenarios:
-    //   [0]  ADF copy activity timed out — upstream blob data never arrived
-    //   [1]  Storage account firewall blocked download (403 AuthorizationFailure)
-    //   [2]  SQL Managed Identity login failed after server was recreated
-    //   [3]  VNet NSG outbound rule blocked TCP 1433 to SQL private endpoint
-    //   [4]  CSV FormatException — Price field contains "N/A" instead of decimal
-
-    private static readonly IReadOnlyList<(string Message, string StackTrace)> DevErrors =
+    private static readonly IReadOnlyList<(string Message, string StackTrace)> FabricatedErrors =
     [
-        // ── Scenario 0: ADF upstream pipeline timeout ────────────────────────
         (
             Message: JsonSerializer.Serialize(new
             {
@@ -80,15 +27,13 @@ public class LoadTradesActivity
                     "Caused by: Azure.RequestFailedException: BlobErrorCode=BlobNotFound (HTTP 404) — " +
                     "The specified blob does not exist. ContainerName=trades BlobName=2026-06-05/positions.csv",
                 },
-                BlobPath      = "trades/2026-06-05/positions.csv",
-                BusinessDate  = DateTime.UtcNow.Date.AddDays(-1).ToString("o"),
+                BlobPath     = "trades/2026-06-05/positions.csv",
+                BusinessDate = DateTime.UtcNow.Date.AddDays(-1).ToString("o"),
             }),
             StackTrace:
                 "at PositionProcessor.Activities.LoadTradesActivity.Run(String blobPath)\n" +
                 "at PositionProcessor.Orchestrators.PositionOrchestrator.RunOrchestrator(TaskOrchestrationContext ctx)"
         ),
-
-        // ── Scenario 1: Storage account firewall 403 ─────────────────────────
         (
             Message: JsonSerializer.Serialize(new
             {
@@ -107,16 +52,14 @@ public class LoadTradesActivity
                     "Azure.RequestFailedException: The remote server returned an error: (403) Forbidden.",
                     "System.Net.WebException: The remote server returned an error: (403) Forbidden.",
                 },
-                BlobPath      = "trades/2026-06-05/positions.csv",
-                BusinessDate  = DateTime.UtcNow.Date.AddDays(-1).ToString("o"),
+                BlobPath     = "trades/2026-06-05/positions.csv",
+                BusinessDate = DateTime.UtcNow.Date.AddDays(-1).ToString("o"),
             }),
             StackTrace:
                 "at Azure.Storage.Blobs.BlobClient.DownloadContentAsync()\n" +
                 "at PositionProcessor.Activities.LoadTradesActivity.Run(String blobPath)\n" +
                 "at PositionProcessor.Orchestrators.PositionOrchestrator.RunOrchestrator(TaskOrchestrationContext ctx)"
         ),
-
-        // ── Scenario 2: SQL Managed Identity login failure ────────────────────
         (
             Message: JsonSerializer.Serialize(new
             {
@@ -137,16 +80,14 @@ public class LoadTradesActivity
                     "Login failed for user 'id-positionprocessor'.",
                     "System.Data.Common.DbException: Login failed for user 'id-positionprocessor'.",
                 },
-                BlobPath      = "trades/2026-06-05/positions.csv",
-                BusinessDate  = DateTime.UtcNow.Date.AddDays(-1).ToString("o"),
+                BlobPath     = "trades/2026-06-05/positions.csv",
+                BusinessDate = DateTime.UtcNow.Date.AddDays(-1).ToString("o"),
             }),
             StackTrace:
                 "at Microsoft.Data.SqlClient.SqlConnection.OpenAsync(CancellationToken)\n" +
                 "at PositionProcessor.Activities.InsertPositionsActivity.Run(InsertInput input)\n" +
                 "at PositionProcessor.Orchestrators.PositionOrchestrator.RunOrchestrator(TaskOrchestrationContext ctx)"
         ),
-
-        // ── Scenario 3: NSG blocking TCP 1433 to SQL private endpoint ─────────
         (
             Message: JsonSerializer.Serialize(new
             {
@@ -168,8 +109,8 @@ public class LoadTradesActivity
                     "System.Net.Sockets.SocketException (10061): " +
                     "No connection could be made because the target machine actively refused it. 10.0.2.5:1433",
                 },
-                BlobPath      = "trades/2026-06-05/positions.csv",
-                BusinessDate  = DateTime.UtcNow.Date.AddDays(-1).ToString("o"),
+                BlobPath     = "trades/2026-06-05/positions.csv",
+                BusinessDate = DateTime.UtcNow.Date.AddDays(-1).ToString("o"),
             }),
             StackTrace:
                 "at System.Data.SqlClient.SqlInternalConnectionTds.AttemptOneLogin()\n" +
@@ -177,8 +118,6 @@ public class LoadTradesActivity
                 "at PositionProcessor.Activities.InsertPositionsActivity.Run(InsertInput input)\n" +
                 "at PositionProcessor.Orchestrators.PositionOrchestrator.RunOrchestrator(TaskOrchestrationContext ctx)"
         ),
-
-        // ── Scenario 4: CSV FormatException on bad price field ────────────────
         (
             Message: JsonSerializer.Serialize(new
             {
@@ -196,8 +135,8 @@ public class LoadTradesActivity
                     "at System.Number.ThrowOverflowOrFormatException(ParsingStatus status, ReadOnlySpan`1 value, TypeCode type)",
                     "at PositionProcessor.Activities.LoadTradesActivity.ParseCsv(String csv) line 47",
                 },
-                BlobPath      = "trades/2026-06-05/positions.csv",
-                BusinessDate  = DateTime.UtcNow.Date.AddDays(-1).ToString("o"),
+                BlobPath     = "trades/2026-06-05/positions.csv",
+                BusinessDate = DateTime.UtcNow.Date.AddDays(-1).ToString("o"),
             }),
             StackTrace:
                 "at PositionProcessor.Activities.LoadTradesActivity.ParseCsv(String csv)\n" +
@@ -206,73 +145,39 @@ public class LoadTradesActivity
         ),
     ];
 
-    public LoadTradesActivity(
-        BlobServiceClient blobClient,
-        IConfiguration config,
-        ILogger<LoadTradesActivity> logger)
+    public LoadTradesActivity(ILogger<LoadTradesActivity> logger)
     {
-        _blobClient     = blobClient;
-        _logger         = logger;
-        _connectionString = config["SqlConnectionString"]!;
-        _injectDevError = string.Equals(
-            config["InjectDevError"], "true",
-            StringComparison.OrdinalIgnoreCase);
+        _logger = logger;
     }
 
     [Function(nameof(LoadTradesActivity))]
-    public async Task Run([ActivityTrigger] object? input = null)
+    public Task<List<TradeRecord>> Run([ActivityTrigger] ProcessingRequest input)
     {
-        // ── Dev error injection ───────────────────────────────────────────────
-        // When InjectDevError=true, skip the real blob download and write a
-        // random error scenario directly to dbo.ApplicationErrors so the full
-        // AIOps pipeline (RAG → Claude → Teams) exercises a realistic failure.
-       
-            await InjectRandomErrorAsync();
-            // Throw so the orchestrator records FAILED in ProcessingRunLog too.
-            throw new InvalidOperationException(
-                "Dev error injection active (InjectDevError=true). " +
-                "A synthetic error has been written to dbo.ApplicationErrors. " +
-                "Set InjectDevError=false to restore normal operation.");
-        
-    }
+        if (input.SimulateFailure)
+        {
+            var idx      = Random.Shared.Next(FabricatedErrors.Count);
+            var scenario = FabricatedErrors[idx];
 
-    // ── Dev helpers ───────────────────────────────────────────────────────────
+            _logger.LogWarning(
+                "LoadTradesActivity: simulating failure scenario {Index}.", idx);
 
-    /// <summary>
-    /// Picks a random error scenario from DevErrors and writes it to
-    /// dbo.ApplicationErrors so the AIOps ErrorPoller picks it up on its
-    /// next 2-minute poll.
-    /// </summary>
-    private async Task InjectRandomErrorAsync()
-    {
-        var idx      = Random.Shared.Next(DevErrors.Count);
-        var scenario = DevErrors[idx];
+            throw new InvalidOperationException(scenario.Message);
+        }
 
-        _logger.LogWarning(
-            "DEV ERROR INJECTION: inserting scenario {Index} into dbo.ApplicationErrors. " +
-            "Set InjectDevError=false to disable.",
-            idx);
+        _logger.LogInformation("LoadTradesActivity: returning fabricated trades.");
 
-        const string sql = """
-            INSERT INTO dbo.ApplicationErrors
-                (ServiceName, ErrorMessage, StackTrace, RunId, CreatedAt)
-            VALUES
-                (@ServiceName, @ErrorMessage, @StackTrace, @RunId, @CreatedAt)
-            """;
+        var trades = new List<TradeRecord>
+        {
+            new("T001", "PORT-A", "AAPL",  100, 189.50m, "BUY",  DateTime.UtcNow),
+            new("T002", "PORT-A", "AAPL",   40, 191.00m, "SELL", DateTime.UtcNow),
+            new("T003", "PORT-A", "MSFT",  200, 415.25m, "BUY",  DateTime.UtcNow),
+            new("T004", "PORT-B", "GOOGL",  50, 172.10m, "BUY",  DateTime.UtcNow),
+            new("T005", "PORT-B", "GOOGL",  10, 174.00m, "SELL", DateTime.UtcNow),
+            new("T006", "PORT-B", "NVDA",   75, 875.00m, "BUY",  DateTime.UtcNow),
+            new("T007", "PORT-C", "TSLA",  120, 245.30m, "BUY",  DateTime.UtcNow),
+            new("T008", "PORT-C", "TSLA",   30, 248.00m, "SELL", DateTime.UtcNow),
+        };
 
-        await using var conn = new SqlConnection(_connectionString);
-        await conn.OpenAsync();
-
-        await using var cmd = new SqlCommand(sql, conn);
-        cmd.Parameters.AddWithValue("@ServiceName",  "PositionProcessor");
-        cmd.Parameters.AddWithValue("@ErrorMessage", scenario.Message);
-        cmd.Parameters.AddWithValue("@StackTrace",   scenario.StackTrace);
-        cmd.Parameters.AddWithValue("@RunId",        $"DEV-{DateTime.UtcNow:yyyyMMdd}-INJECT{idx:D2}");
-        cmd.Parameters.AddWithValue("@CreatedAt",    DateTime.UtcNow);
-
-        await cmd.ExecuteNonQueryAsync();
-
-        _logger.LogWarning(
-            "DEV ERROR INJECTION: scenario {Index} written to dbo.ApplicationErrors.", idx);
+        return Task.FromResult(trades);
     }
 }

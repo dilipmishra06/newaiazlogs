@@ -23,7 +23,7 @@ public record PositionResult(
 );
 
 // Input/output for the orchestrator
-public record ProcessingRequest(string BlobPath, string RunId, DateTime BusinessDate);
+public record ProcessingRequest(string BlobPath, string RunId, DateTime BusinessDate, bool SimulateFailure);
 public record ProcessingResult(int TradesLoaded, int PositionsInserted, bool Success, string? Error);
 
 // Input for InsertPositionsActivity — includes optional error message for AI reasoning
