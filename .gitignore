@@ -1,8 +1,0 @@
-logs/
-.env
-obj/
-terraform/
-__pycache__/
-local.settings.json
-bin/
-aiopsc.*
